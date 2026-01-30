@@ -1,14 +1,26 @@
 import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart } from '../context/CartContext';
+import { useProducts } from '../context/ProductContext';
 import { trackEvent, createOrder } from '../services/supabase';
 import { STORE_PHONE_NUMBER } from '../constants';
 
 const Cart: React.FC = () => {
   const { items, removeFromCart, updateQuantity, total, clearCart } = useCart();
+  const { products, updateProduct, refreshProducts } = useProducts(); // Acesso ao estoque real
   const [customerName, setCustomerName] = useState('');
   const [notes, setNotes] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Validação de Estoque em Tempo Real
+  const stockValidation = items.map(item => {
+    const liveProduct = products.find(p => p.id === item.id);
+    const availableStock = liveProduct ? liveProduct.stock : 0;
+    const hasStock = availableStock >= item.quantity;
+    return { ...item, availableStock, hasStock };
+  });
+
+  const hasStockIssues = stockValidation.some(i => !i.hasStock);
 
   if (items.length === 0) {
     return (
@@ -29,46 +41,70 @@ const Cart: React.FC = () => {
 
   const handleCheckout = async () => {
     if (!customerName.trim()) {
-        alert("Por favor, digite seu nome.");
+        alert("Por favor, digite seu nome para identificarmos o pedido.");
+        return;
+    }
+
+    if (hasStockIssues) {
+        alert("Alguns itens do seu carrinho ultrapassam o estoque disponível. Por favor, ajuste as quantidades.");
         return;
     }
 
     setIsSubmitting(true);
     trackEvent('checkout_start', undefined, { total, itemsCount: items.length });
 
-    // 1. Create Internal Order Record
-    await createOrder({
-        customer_name: customerName,
-        total: total,
-        status: 'pending',
-        items: items,
-        notes: notes
-    });
+    try {
+        // 1. Salvar Pedido (Histórico)
+        await createOrder({
+            customer_name: customerName,
+            total: total,
+            status: 'pending',
+            items: items,
+            notes: notes
+        });
 
-    // 2. Format WhatsApp Message
-    let message = `*🛍️ Novo Pedido - Lojinhas das Graças*\n\n`;
-    message += `*Cliente:* ${customerName}\n\n`;
-    
-    items.forEach(item => {
-      const price = item.promoPrice || item.price;
-      message += `• ${item.quantity}x ${item.name} - R$ ${price.toFixed(2)}\n`;
-    });
-    
-    message += `\n*Total:* R$ ${total.toFixed(2)}\n`;
-    
-    if (notes) message += `\n*Obs:* ${notes}\n`;
-    
-    message += `\nPagamento via Pix.\n`;
-    message += `Deus abençoe 🙏`;
+        // 2. Abater Estoque (Core Logic)
+        for (const item of items) {
+            const liveProduct = products.find(p => p.id === item.id);
+            if (liveProduct) {
+                const newStock = Math.max(0, liveProduct.stock - item.quantity);
+                await updateProduct(item.id, { stock: newStock });
+            }
+        }
+        
+        // 3. Atualizar contexto local para refletir novo estoque na UI imediatamente
+        await refreshProducts();
 
-    const url = `https://wa.me/${STORE_PHONE_NUMBER}?text=${encodeURIComponent(message)}`;
-    
-    trackEvent('checkout_complete', undefined, { total });
-    clearCart();
-    setIsSubmitting(false);
-    
-    // 3. Redirect
-    window.open(url, '_blank');
+        // 4. Formatar Mensagem WhatsApp
+        let message = `*🛍️ Novo Pedido - Lojinhas das Graças*\n\n`;
+        message += `*Cliente:* ${customerName}\n\n`;
+        
+        items.forEach(item => {
+        const price = item.promoPrice || item.price;
+        message += `• ${item.quantity}x ${item.name} - R$ ${price.toFixed(2)}\n`;
+        });
+        
+        message += `\n*Total:* R$ ${total.toFixed(2)}\n`;
+        
+        if (notes) message += `\n*Obs:* ${notes}\n`;
+        
+        message += `\nPagamento via Pix a combinar.\n`;
+        message += `Aguardo confirmação! 🙏`;
+
+        const url = `https://wa.me/${STORE_PHONE_NUMBER}?text=${encodeURIComponent(message)}`;
+        
+        trackEvent('checkout_complete', undefined, { total });
+        clearCart();
+        
+        // 5. Redirecionar
+        window.open(url, '_blank');
+
+    } catch (error) {
+        console.error("Checkout error:", error);
+        alert("Houve um erro ao processar o pedido. Tente novamente.");
+    } finally {
+        setIsSubmitting(false);
+    }
   };
 
   return (
@@ -78,46 +114,58 @@ const Cart: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
         {/* Item List */}
         <div className="lg:col-span-2 space-y-6">
-          {items.map(item => {
+          {stockValidation.map(item => {
              const finalPrice = item.promoPrice || item.price;
              return (
-                <div key={item.id} className="flex gap-6 py-6 border-b border-gray-100 dark:border-gray-800 last:border-0">
-                <div className="w-24 h-32 bg-gray-100 dark:bg-gray-800 overflow-hidden flex-shrink-0 rounded-sm">
-                    <img src={item.image} alt={item.name} className="w-full h-full object-cover" />
-                </div>
-                
-                <div className="flex-1 flex flex-col justify-between">
-                    <div>
-                        <h3 className="font-bold text-gray-900 dark:text-white text-sm uppercase tracking-wide mb-1">{item.name}</h3>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">{item.category}</p>
-                        <div className="flex gap-2 items-center">
-                             {item.promoPrice && (
-                                 <span className="text-xs text-gray-400 line-through">R$ {item.price.toFixed(2)}</span>
-                             )}
-                             <div className="font-bold text-brand-600 dark:text-brand-400">R$ {finalPrice.toFixed(2)}</div>
-                        </div>
+                <div key={item.id} className={`flex gap-6 py-6 border-b border-gray-100 dark:border-gray-800 last:border-0 ${!item.hasStock ? 'opacity-80' : ''}`}>
+                    <div className="w-24 h-32 bg-gray-100 dark:bg-gray-800 overflow-hidden flex-shrink-0 rounded-sm relative">
+                        <img src={item.image} alt={item.name} className="w-full h-full object-cover" />
+                        {!item.hasStock && (
+                            <div className="absolute inset-0 bg-white/80 dark:bg-black/80 flex items-center justify-center text-center p-1">
+                                <span className="text-[10px] font-bold text-red-600 uppercase leading-tight">Sem Estoque Suficiente</span>
+                            </div>
+                        )}
                     </div>
                     
-                    <div className="flex items-center justify-between mt-4">
-                        <div className="flex items-center border border-gray-200 dark:border-gray-700 rounded-sm">
-                            <button 
-                                onClick={() => updateQuantity(item.id, item.quantity - 1)}
-                                className="px-3 py-1 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 transition"
-                            >-</button>
-                            <span className="px-2 text-xs font-bold text-gray-900 dark:text-white">{item.quantity}</span>
-                            <button 
-                                onClick={() => updateQuantity(item.id, item.quantity + 1)}
-                                className="px-3 py-1 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 transition"
-                            >+</button>
+                    <div className="flex-1 flex flex-col justify-between">
+                        <div>
+                            <h3 className="font-bold text-gray-900 dark:text-white text-sm uppercase tracking-wide mb-1">{item.name}</h3>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">{item.category}</p>
+                            <div className="flex gap-2 items-center">
+                                {item.promoPrice && (
+                                    <span className="text-xs text-gray-400 line-through">R$ {item.price.toFixed(2)}</span>
+                                )}
+                                <div className="font-bold text-brand-600 dark:text-brand-400">R$ {finalPrice.toFixed(2)}</div>
+                            </div>
+                            
+                            {!item.hasStock && (
+                                <p className="text-xs text-red-500 font-bold mt-2">
+                                    Disponível: {item.availableStock} unid.
+                                </p>
+                            )}
                         </div>
-                        <button 
-                            onClick={() => removeFromCart(item.id)}
-                            className="text-xs font-bold text-red-400 hover:text-red-600 uppercase tracking-wider"
-                        >
-                            Remover
-                        </button>
+                        
+                        <div className="flex items-center justify-between mt-4">
+                            <div className={`flex items-center border rounded-sm ${!item.hasStock ? 'border-red-200 bg-red-50 dark:bg-red-900/20 dark:border-red-900' : 'border-gray-200 dark:border-gray-700'}`}>
+                                <button 
+                                    onClick={() => updateQuantity(item.id, item.quantity - 1)}
+                                    className="px-3 py-1 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 transition"
+                                >-</button>
+                                <span className={`px-2 text-xs font-bold ${!item.hasStock ? 'text-red-600' : 'text-gray-900 dark:text-white'}`}>{item.quantity}</span>
+                                <button 
+                                    onClick={() => updateQuantity(item.id, item.quantity + 1)}
+                                    className="px-3 py-1 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 transition"
+                                    disabled={item.quantity >= item.availableStock}
+                                >+</button>
+                            </div>
+                            <button 
+                                onClick={() => removeFromCart(item.id)}
+                                className="text-xs font-bold text-red-400 hover:text-red-600 uppercase tracking-wider"
+                            >
+                                Remover
+                            </button>
+                        </div>
                     </div>
-                </div>
                 </div>
              );
           })}
@@ -159,10 +207,16 @@ const Cart: React.FC = () => {
                     />
                 </div>
                 
+                {hasStockIssues && (
+                    <div className="bg-red-100 border border-red-200 text-red-700 px-4 py-3 rounded text-xs mb-4">
+                        <strong>Atenção:</strong> Você possui itens com quantidade superior ao nosso estoque disponível. Ajuste as quantidades para prosseguir.
+                    </div>
+                )}
+                
                 <button 
                 onClick={handleCheckout}
-                disabled={isSubmitting}
-                className="w-full bg-[#25D366] hover:bg-[#128C7E] text-white py-4 rounded font-bold uppercase tracking-widest text-sm shadow-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-wait"
+                disabled={isSubmitting || hasStockIssues}
+                className="w-full bg-[#25D366] hover:bg-[#128C7E] text-white py-4 rounded font-bold uppercase tracking-widest text-sm shadow-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-gray-400"
                 >
                     {isSubmitting ? 'Gerando Pedido...' : (
                         <>
